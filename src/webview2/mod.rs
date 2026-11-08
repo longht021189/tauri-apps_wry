@@ -36,7 +36,7 @@ use super::Theme;
 use crate::{
   Error, MemoryUsageLevel, NewWindowFeatures, NewWindowOpener, NewWindowResponse, PageLoadEvent,
   PermissionKind, PermissionResponse, RGBA, Rect, RequestAsyncResponder, Result, WebViewAttributes,
-  custom_protocol_workaround, proxy::ProxyConfig,
+  custom_protocol_workaround, http_interception, proxy::ProxyConfig,
 };
 
 type EventRegistrationToken = i64;
@@ -499,7 +499,7 @@ impl InnerWebView {
       .iter()
       .map(|n| n.0.clone())
       .collect();
-    if !attributes.custom_protocols.is_empty() {
+    if !attributes.custom_protocols.is_empty() || !attributes.http_interceptors.is_empty() {
       unsafe {
         Self::attach_custom_protocol_handler(
           &webview,
@@ -1018,12 +1018,22 @@ impl InnerWebView {
     token: &mut EventRegistrationToken,
   ) -> Result<()> {
     unsafe {
-      for name in attributes.custom_protocols.keys() {
-        // WebView2 supports non-standard protocols only on Windows 10+, so we have to use this workaround
-        // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
+      // WebView2 supports non-standard protocols only on Windows 10+, so we have to use this workaround
+      // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
+      let custom_protocol_filters = attributes.custom_protocols.keys().map(|name| {
         let work_around_uri =
           custom_protocol_workaround::work_around_uri_prefix(http_or_https, name);
-        let filter = HSTRING::from(format!("{work_around_uri}*"));
+        format!("{work_around_uri}*")
+      });
+      // HTTP interceptors are keyed by normalized origin (`<scheme>://<host>[:<port>]`),
+      // or `<scheme>://*`, which gives the filter `<scheme>://*/*`
+      let http_interceptor_filters = attributes
+        .http_interceptors
+        .keys()
+        .map(|origin| format!("{origin}/*"));
+
+      for filter in custom_protocol_filters.chain(http_interceptor_filters) {
+        let filter = HSTRING::from(filter);
 
         // If WebView2 version is high enough, use the new API to add the filter to allow Shared Workers and
         // iframes to work with custom protocols
@@ -1046,6 +1056,7 @@ impl InnerWebView {
 
       let env = env.clone();
       let custom_protocols = std::mem::take(&mut attributes.custom_protocols);
+      let http_interceptors = std::mem::take(&mut attributes.http_interceptors);
       let main_thread_id = std::thread::current().id();
 
       webview.add_WebResourceRequested(
@@ -1070,11 +1081,30 @@ impl InnerWebView {
         #[cfg(feature = "tracing")]
         span.record("uri", &uri);
 
-        if let Some((custom_protocol, custom_protocol_handler)) = custom_protocols
-          .iter()
-          .find(|(protocol, _)| custom_protocol_workaround::is_work_around_uri(&uri, http_or_https, protocol))
-        {
-          let request = match Self::prepare_request(http_or_https, custom_protocol, &webview_request, &uri)
+        // Precedence: exact-origin interceptor, custom protocol, wildcard interceptor.
+        // Interceptors keep the request URI unchanged.
+        let handler = http_interception::find_exact(&http_interceptors, &uri)
+          .map(|handler| (handler, uri.clone()))
+          .or_else(|| {
+            custom_protocols
+              .iter()
+              .find(|(protocol, _)| {
+                custom_protocol_workaround::is_work_around_uri(&uri, http_or_https, protocol)
+              })
+              .map(|(protocol, handler)| {
+                // Undo the protocol workaround when giving path to resolver
+                let uri =
+                  custom_protocol_workaround::revert_uri_work_around(&uri, http_or_https, protocol);
+                (handler, uri)
+              })
+          })
+          .or_else(|| {
+            http_interception::find_wildcard(&http_interceptors, &uri)
+              .map(|handler| (handler, uri.clone()))
+          });
+
+        if let Some((custom_protocol_handler, request_uri)) = handler {
+          let request = match Self::prepare_request(&webview_request, &request_uri)
           {
             Ok(req) => req,
             Err(e) => {
@@ -1136,10 +1166,8 @@ impl InnerWebView {
 
   #[inline]
   unsafe fn prepare_request(
-    http_or_https: &'static str,
-    custom_protocol: &str,
     webview_request: &ICoreWebView2WebResourceRequest,
-    webview_request_uri: &str,
+    request_uri: &str,
   ) -> Result<http::Request<Vec<u8>>> {
     unsafe {
       let mut request = Request::builder();
@@ -1188,14 +1216,7 @@ impl InnerWebView {
         }
       }
 
-      // Undo the protocol workaround when giving path to resolver
-      let path = custom_protocol_workaround::revert_uri_work_around(
-        webview_request_uri,
-        http_or_https,
-        custom_protocol,
-      );
-
-      let request = request.uri(&path).body(body_sent)?;
+      let request = request.uri(request_uri).body(body_sent)?;
 
       Ok(request)
     }

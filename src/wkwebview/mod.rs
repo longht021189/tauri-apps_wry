@@ -5,6 +5,7 @@
 mod download;
 #[cfg(target_os = "macos")]
 mod drag_drop;
+mod http_interception;
 mod navigation;
 #[cfg(feature = "mac-proxy")]
 mod proxy;
@@ -289,9 +290,24 @@ impl InnerWebView {
         data_store
       };
 
+      // `with_http_interceptor`: one handler per intercepted scheme (`http`, `https`),
+      // registered like a custom protocol.
+      let http_scheme_handlers =
+        http_interception::scheme_handlers(attributes.http_interceptors, attributes.incognito);
+      if let Some(scheme) = http_scheme_handlers
+        .keys()
+        .find(|scheme| attributes.custom_protocols.contains_key(*scheme))
+      {
+        return Err(Error::UrlSchemeRegisterError(scheme.clone()));
+      }
+
       // Register Custom Protocols
       let mut protocol_ptrs = Vec::new();
-      for (name, function) in attributes.custom_protocols {
+      for (name, function) in attributes
+        .custom_protocols
+        .into_iter()
+        .chain(http_scheme_handlers)
+      {
         // <https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/urlschemehandler(forurlscheme:)>
         // Available: macOS 10.13+, iOS 11+
         let already_registered = using_existing_config

@@ -70,6 +70,12 @@ pub enum Error {
   DuplicateCustomProtocol(String),
   #[error("Duplicate custom protocol '{0}' registered on the same web context on Linux")]
   ContextDuplicateCustomProtocol(String),
+  #[error("HTTP interception is not supported on this platform")]
+  HttpInterceptionUnsupported,
+  #[error("Invalid HTTP interceptor origin '{0}', expected `http(s)://<host>[:<port>]`")]
+  InvalidHttpInterceptorOrigin(String),
+  #[error("Duplicate HTTP interceptor '{0}' registered on the WebViewBuilder")]
+  DuplicateHttpInterceptor(String),
   #[error(transparent)]
   #[cfg(any(target_os = "macos", target_os = "ios"))]
   UrlParse(#[from] url::ParseError),

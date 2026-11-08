@@ -22,6 +22,12 @@
   @android.webkit.JavascriptInterface public <methods>;
 }
 
+-keep class {{package-unescaped}}.HttpBodies {
+  public <init>(...);
+
+  @android.webkit.JavascriptInterface public <methods>;
+}
+
 -keep class {{package-unescaped}}.RustWebView {
   public <init>(...);
 

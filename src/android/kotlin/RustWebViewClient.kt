@@ -43,7 +43,8 @@ class RustWebViewClient(webView: RustWebView, context: Context): WebViewClient()
             assetLoader.shouldInterceptRequest(request.url)
         } else {
             val rustWebView = view as RustWebView
-            val response = Rust.handleRequest(rustWebView.id, request, rustWebView.isDocumentStartScriptEnabled)
+            val body = rustWebView.httpBodies?.take(request)
+            val response = Rust.handleRequest(rustWebView.id, request, rustWebView.isDocumentStartScriptEnabled, body)
             if (response != null) {
                 if (response.responseHeaders != null) {
                     response.responseHeaders["Cache-Control"] = "no-store"

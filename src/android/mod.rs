@@ -5,7 +5,8 @@
 use super::{PageLoadEvent, RGBA, WebViewAttributes};
 use crate::{
   Error, PermissionKind, PermissionResponse, RequestAsyncResponder, Result,
-  custom_protocol_workaround, inject_initialization_scripts::inject_scripts_into_html,
+  custom_protocol_workaround, http_interception,
+  inject_initialization_scripts::inject_scripts_into_html,
 };
 use crossbeam_channel::*;
 
@@ -183,6 +184,7 @@ impl InnerWebView {
       #[cfg(any(debug_assertions, feature = "devtools"))]
       devtools,
       custom_protocols,
+      http_interceptors,
       background_color,
       transparent,
       headers,
@@ -224,27 +226,44 @@ impl InnerWebView {
         .insert(id.clone(), domain);
     }
 
+    // `shouldInterceptRequest` never exposes request bodies: with interceptors, `HttpBodies`
+    // lets the app's initialization script hand them over (see `with_http_interceptor`).
+    let http_bodies = !http_interceptors.is_empty();
+
     let initialization_scripts_ = initialization_scripts.clone();
     REQUEST_HANDLER.lock().unwrap().insert(
       id.clone(),
       UnsafeRequestHandler::new(Arc::new(
         move |webview_id, mut request, is_document_start_script_enabled| {
           let uri = request.uri().to_string();
-          let (custom_protocol, custom_protocol_handler) =
+
+          // Precedence: exact-origin interceptor, custom protocol, wildcard interceptor.
+          // Interceptors keep the request URI unchanged.
+          let custom_protocol = || {
             custom_protocols.iter().find(|(protocol, _)| {
               custom_protocol_workaround::is_work_around_uri(&uri, http_or_https, protocol)
-            })?;
+            })
+          };
 
-          let uri_res = custom_protocol_workaround::revert_uri_work_around(
-            &uri,
-            http_or_https,
-            custom_protocol,
-          )
-          .parse();
+          let handler = if let Some(interceptor) = http_interception::find_exact(&http_interceptors, &uri) {
+            interceptor
+          } else if let Some((custom_protocol, custom_protocol_handler)) = custom_protocol() {
 
-          if let Ok(uri) = uri_res {
-            *request.uri_mut() = uri;
-          }
+            let uri_res = custom_protocol_workaround::revert_uri_work_around(
+              &uri,
+              http_or_https,
+              custom_protocol,
+            )
+            .parse();
+
+            if let Ok(uri) = uri_res {
+              *request.uri_mut() = uri;
+            }
+
+            custom_protocol_handler
+          } else {
+            http_interception::find_wildcard(&http_interceptors, &uri)?
+          };
 
           let (tx, rx) = channel();
           let initialization_scripts = initialization_scripts_.clone();
@@ -259,7 +278,7 @@ impl InnerWebView {
             },
           );
 
-          (custom_protocol_handler)(webview_id, request, RequestAsyncResponder { responder });
+          (handler)(webview_id, request, RequestAsyncResponder { responder });
           // 3x the timeout while we monitor https://github.com/tauri-apps/wry/issues/1551
           // TODO: Remove timeout
           rx.recv_timeout(MAIN_PIPE_TIMEOUT * 3)
@@ -322,6 +341,7 @@ impl InnerWebView {
       user_agent,
       initialization_scripts,
       javascript_disabled,
+      http_bodies,
     };
 
     WEBVIEW_ATTRIBUTES

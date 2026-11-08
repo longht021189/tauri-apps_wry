@@ -166,6 +166,7 @@ impl<'a> MainPipe<'a> {
           initialization_scripts,
           id,
           javascript_disabled,
+          http_bodies,
           ..
         } = attrs;
 
@@ -303,6 +304,17 @@ impl<'a> MainPipe<'a> {
           format!("(L{webview_class_name};L{client_class_name};)V"),
           &[(&webview).into(), (&webview_client).into()],
         )?;
+
+        // HttpBodies registers itself as `window.__wryHttpBodies`, before the first page loads
+        if http_bodies {
+          let http_bodies_class =
+            find_class(&mut self.env, &activity, format!("{package}/HttpBodies"))?;
+          self.env.new_object(
+            http_bodies_class,
+            format!("(L{webview_class_name};)V"),
+            &[(&webview).into()],
+          )?;
+        }
 
         // Set content view
         self.env.call_method(
@@ -635,6 +647,8 @@ pub(crate) struct CreateWebViewAttributes {
   pub user_agent: Option<String>,
   pub initialization_scripts: Vec<InitializationScript>,
   pub javascript_disabled: bool,
+  /// Whether to create `HttpBodies`, for HTTP interceptors.
+  pub http_bodies: bool,
 }
 
 // SAFETY: only use this when you are sure the span will be dropped on the same thread it was entered

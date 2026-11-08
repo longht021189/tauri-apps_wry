@@ -393,7 +393,8 @@ class RustWebChromeClient(private val activity: WryActivity, private val webView
     activity.launchActivityForResult(takeVideoIntent) { result ->
       var res: Array<Uri?>? = null
       if (result?.resultCode == Activity.RESULT_OK) {
-        res = arrayOf(result.data!!.data)
+        // Some camera apps return RESULT_OK without a result intent or data URI.
+        res = result.data?.data?.let { arrayOf<Uri?>(it) }
       }
       filePathCallback.onReceiveValue(res)
     }
@@ -408,23 +409,23 @@ class RustWebChromeClient(private val activity: WryActivity, private val webView
     if (fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
       intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
     }
-    if (fileChooserParams.acceptTypes.size > 1 || intent.type!!.startsWith(".")) {
+    // `createIntent()` may return an intent without a type.
+    val isExtensionType = intent.type?.startsWith(".") == true
+    if (fileChooserParams.acceptTypes.size > 1 || isExtensionType) {
       val validTypes = getValidTypes(fileChooserParams.acceptTypes)
       intent.putExtra(Intent.EXTRA_MIME_TYPES, validTypes)
-      if (intent.type!!.startsWith(".")) {
-        intent.type = validTypes[0]
+      if (isExtensionType) {
+        // The extension may not map to any known MIME type.
+        intent.type = validTypes.firstOrNull() ?: "*/*"
       }
     }
     try {
       activity.launchActivityForResult(intent) { result ->
         val res: Array<Uri?>?
         val resultIntent = result?.data
-        if (result?.resultCode == Activity.RESULT_OK && resultIntent!!.clipData != null) {
-          val numFiles = resultIntent.clipData!!.itemCount
-          res = arrayOfNulls(numFiles)
-          for (i in 0 until numFiles) {
-            res[i] = resultIntent.clipData!!.getItemAt(i).uri
-          }
+        val clipData = resultIntent?.clipData
+        if (result?.resultCode == Activity.RESULT_OK && clipData != null) {
+          res = Array<Uri?>(clipData.itemCount) { i -> clipData.getItemAt(i).uri }
         } else {
           res = FileChooserParams.parseResult(
             result?.resultCode ?: 0,

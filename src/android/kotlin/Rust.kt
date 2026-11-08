@@ -34,7 +34,7 @@ object Rust {
     @JvmStatic external fun ipc(webviewId: String, url: String, message: String)
 
     @JvmStatic external fun assetLoaderDomain(webviewId: String): String?
-    @JvmStatic external fun handleRequest(webviewId: String, request: WebResourceRequest, isDocumentStartScriptEnabled: Boolean): WebResourceResponse?
+    @JvmStatic external fun handleRequest(webviewId: String, request: WebResourceRequest, isDocumentStartScriptEnabled: Boolean, body: ByteArray?): WebResourceResponse?
     @JvmStatic external fun shouldOverride(webviewId: String, url: String): Boolean
     @JvmStatic external fun onPageLoading(webviewId: String, url: String)
     @JvmStatic external fun onPageLoaded(webviewId: String, url: String)

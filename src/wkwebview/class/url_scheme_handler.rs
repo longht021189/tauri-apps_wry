@@ -4,27 +4,38 @@
 
 use std::{
   borrow::Cow,
+  cell::Cell,
   ffi::{CStr, c_char},
   panic::AssertUnwindSafe,
   ptr::NonNull,
+  rc::Rc,
+  sync::Arc,
 };
 
+use block2::RcBlock;
 use http::{
-  Request, Response as HttpResponse, StatusCode, Version,
-  header::{CONTENT_LENGTH, CONTENT_TYPE},
+  HeaderMap, Method, Request, Response as HttpResponse, StatusCode,
+  header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
 };
 use objc2::{
-  AllocAnyThread, ClassType, Message,
+  AllocAnyThread, ClassType, Message, msg_send,
   rc::Retained,
-  runtime::{AnyClass, AnyObject, ClassBuilder, ProtocolObject},
+  runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel},
+  sel,
 };
 use objc2_foundation::{
-  NSData, NSHTTPURLResponse, NSMutableDictionary, NSObject, NSObjectProtocol, NSString, NSURL,
-  NSUUID,
+  NSData, NSHTTPURLResponse, NSMutableDictionary, NSMutableURLRequest, NSObject, NSObjectProtocol,
+  NSString, NSURL, NSURLRequest, NSUUID,
 };
 use objc2_web_kit::{WKURLSchemeHandler, WKURLSchemeTask};
 
 use crate::{RequestAsyncResponder, WryWebView, wkwebview::WEBVIEW_STATE};
+
+type ProtocolFn =
+  Rc<dyn Fn(crate::WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync>;
+
+/// Redirects followed within one task. Past this, the `3xx` response is delivered as-is.
+const MAX_REDIRECTS: u8 = 20;
 
 pub fn create(name: &str) -> &AnyClass {
   unsafe {
@@ -75,6 +86,7 @@ extern "C" fn start_task(
       .to_str()
       .ok()
       .unwrap_or_default()
+      .to_string()
   };
 
   let ivar = this.class().instance_variable(c"protocol_index").unwrap();
@@ -83,254 +95,361 @@ extern "C" fn start_task(
   let function = WEBVIEW_STATE
     .read()
     .unwrap()
-    .get(webview_id)
+    .get(&webview_id)
     .and_then(|v| v.protocol_ptrs.get(protocol_index))
     .cloned();
 
-  if let Some(function) = function {
-    // Get url request
-    let request = unsafe { task.request() };
-    let url = request.URL().unwrap();
-
-    let uri = url.absoluteString().unwrap().to_string();
-
-    #[cfg(feature = "tracing")]
-    span.record("uri", uri.clone());
-
-    // Get request method (GET, POST, PUT etc...)
-    let method = request.HTTPMethod().unwrap().to_string();
-
-    // Prepare our HttpRequest
-    let mut http_request = Request::builder().uri(uri).method(method.as_str());
-
-    // Get body
-    let mut sent_form_body = Vec::new();
-    let body = request.HTTPBody();
-    let body_stream = request.HTTPBodyStream();
-    if let Some(body) = body {
-      sent_form_body = body.to_vec();
-    } else if let Some(body_stream) = body_stream {
-      body_stream.open();
-
-      let mut buf = [0u8; 128];
-      while body_stream.hasBytesAvailable() {
-        let count =
-          unsafe { body_stream.read_maxLength(NonNull::new(buf.as_mut_ptr()).unwrap(), buf.len()) };
-        sent_form_body.extend_from_slice(&buf[..count as usize]);
-      }
-
-      body_stream.close();
-    }
-
-    // Extract all headers fields
-    let all_headers = request.allHTTPHeaderFields();
-
-    // get all our headers values and inject them in our request
-    if let Some(all_headers) = all_headers {
-      for current_header in all_headers.allKeys().iter() {
-        let header_value = all_headers.valueForKey(&current_header).unwrap();
-        // inject the header into the request
-        http_request = http_request.header(current_header.to_string(), header_value.to_string());
-      }
-    }
-
-    let respond_with_404 = || {
-      let urlresponse = NSHTTPURLResponse::alloc();
-      let response = NSHTTPURLResponse::initWithURL_statusCode_HTTPVersion_headerFields(
-        urlresponse,
-        &url,
-        StatusCode::NOT_FOUND.as_u16().try_into().unwrap(),
-        Some(&NSString::from_str(
-          format!("{:#?}", Version::HTTP_11).as_str(),
-        )),
-        None,
-      )
-      .unwrap();
-      unsafe {
-        task.didReceiveResponse(&response);
-        // Finish
-        task.didFinish();
-      }
-    };
-
-    fn check_webview_id_valid(webview_id: &str) -> crate::Result<()> {
-      if !WEBVIEW_STATE.read().unwrap().contains_key(webview_id) {
-        return Err(crate::Error::CustomProtocolTaskInvalid);
-      }
-      Ok(())
-    }
-
-    /// Task may not live longer than async custom protocol handler.
-    ///
-    /// There are roughly 2 ways to cause segfault:
-    /// 1. Task has stopped. pointer of the task not valid anymore.
-    /// 2. Task had stopped, but the pointer of the task has allocated to a new task.
-    ///    Outdated custom handler may call to the new task instance and cause segfault.
-    fn check_task_is_valid(
-      webview: &WryWebView,
-      task_key: usize,
-      current_uuid: Retained<NSUUID>,
-    ) -> crate::Result<()> {
-      let latest_task_uuid = webview.get_custom_task_uuid(task_key);
-      let Some(latest_uuid) = latest_task_uuid else {
-        return Err(crate::Error::CustomProtocolTaskInvalid);
-      };
-      if latest_uuid != current_uuid {
-        return Err(crate::Error::CustomProtocolTaskInvalid);
-      }
-      Ok(())
-    }
-
-    // send response
-    match http_request.body(sent_form_body) {
-      Ok(final_request) => {
-        let webview = webview.retain();
-        let task = task.retain();
-        let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
-          Box::new(move |sent_response| {
-            // Consolidate checks before calling into `did*` methods.
-            let validate = || -> crate::Result<()> {
-              check_webview_id_valid(webview_id)?;
-              check_task_is_valid(&webview, task_key, task_uuid.clone())?;
-              Ok(())
-            };
-
-            // Perform an upfront validation
-            if let Err(_e) = validate() {
-              #[cfg(feature = "tracing")]
-              tracing::warn!("Task invalid before sending response: {:?}", _e);
-              return; // If invalid, return early without calling task methods.
-            }
-
-            fn response(
-              // FIXME: though we give it a static lifetime, it's not guaranteed to be valid.
-              task: Retained<ProtocolObject<dyn WKURLSchemeTask>>,
-              // FIXME: though we give it a static lifetime, it's not guaranteed to be valid.
-              webview: Retained<WryWebView>,
-              task_key: usize,
-              task_uuid: Retained<NSUUID>,
-              webview_id: &str,
-              url: Retained<NSURL>,
-              sent_response: HttpResponse<Cow<'_, [u8]>>,
-            ) -> crate::Result<()> {
-              // Validate
-              check_webview_id_valid(webview_id)?;
-              check_task_is_valid(&webview, task_key, task_uuid.clone())?;
-
-              let content_len = sent_response.body().len();
-              // default: application/octet-stream, but should be provided by the client
-              let wanted_mime = sent_response.headers().get(CONTENT_TYPE);
-              // default to 200
-              let wanted_status_code = sent_response.status().as_u16() as i32;
-              // default to HTTP/1.1
-              let wanted_version = format!("{:#?}", sent_response.version());
-
-              let headers = NSMutableDictionary::new();
-              if let Some(mime) = wanted_mime {
-                headers.insert(
-                  &*NSString::from_str(CONTENT_TYPE.as_str()),
-                  &*NSString::from_str(mime.to_str().unwrap()),
-                );
-              }
-              headers.insert(
-                &*NSString::from_str(CONTENT_LENGTH.as_str()),
-                &*NSString::from_str(&content_len.to_string()),
-              );
-
-              // add headers
-              for (name, value) in sent_response.headers().iter() {
-                if let Ok(value) = value.to_str() {
-                  headers.insert(
-                    &*NSString::from_str(name.as_str()),
-                    &*NSString::from_str(value),
-                  );
-                }
-              }
-
-              let urlresponse = NSHTTPURLResponse::alloc();
-              let response = NSHTTPURLResponse::initWithURL_statusCode_HTTPVersion_headerFields(
-                urlresponse,
-                &url,
-                wanted_status_code.try_into().unwrap(),
-                Some(&NSString::from_str(&wanted_version)),
-                Some(&headers),
-              )
-              .unwrap();
-
-              // Re-validate before calling didReceiveResponse
-              check_webview_id_valid(webview_id)?;
-              check_task_is_valid(&webview, task_key, task_uuid.clone())?;
-
-              // Use map_err to convert Option<Retained<Exception>> to crate::Error
-              objc2::exception::catch(AssertUnwindSafe(|| unsafe {
-                task.didReceiveResponse(&response);
-              }))
-              .map_err(|_e| crate::Error::CustomProtocolTaskInvalid)?;
-
-              let data = match sent_response.into_body() {
-                Cow::Owned(content) => NSData::from_vec(content),
-                Cow::Borrowed(content) => NSData::with_bytes(content),
-              };
-
-              // Check validity again
-              check_webview_id_valid(webview_id)?;
-              check_task_is_valid(&webview, task_key, task_uuid.clone())?;
-
-              objc2::exception::catch(AssertUnwindSafe(|| unsafe {
-                task.didReceiveData(&data);
-              }))
-              .map_err(|_e| crate::Error::CustomProtocolTaskInvalid)?;
-
-              check_webview_id_valid(webview_id)?;
-              check_task_is_valid(&webview, task_key, task_uuid)?;
-
-              objc2::exception::catch(AssertUnwindSafe(|| unsafe {
-                task.didFinish();
-              }))
-              .map_err(|_e| crate::Error::CustomProtocolTaskInvalid)?;
-
-              if WEBVIEW_STATE.read().unwrap().contains_key(webview_id) {
-                webview.remove_custom_task_key(task_key);
-                Ok(())
-              } else {
-                Err(crate::Error::CustomProtocolTaskInvalid)
-              }
-            }
-
-            #[cfg(feature = "tracing")]
-            let _span = tracing::info_span!("wry::custom_protocol::call_handler").entered();
-
-            if let Err(_e) = response(
-              task,
-              webview,
-              task_key,
-              task_uuid,
-              webview_id,
-              url,
-              sent_response,
-            ) {
-              #[cfg(feature = "tracing")]
-              tracing::error!("Error responding to task: {:?}", _e);
-            }
-          });
-
-        #[cfg(feature = "tracing")]
-        let _span = tracing::info_span!("wry::custom_protocol::call_handler").entered();
-
-        function(
-          webview_id,
-          final_request,
-          RequestAsyncResponder { responder },
-        );
-      }
-      Err(_) => respond_with_404(),
-    };
-  } else {
+  let Some(function) = function else {
     #[cfg(feature = "tracing")]
     tracing::warn!(
       "Either WebView or WebContext instance is dropped! This handler shouldn't be called."
     );
+    return;
   };
+
+  let ns_request = unsafe { task.request() };
+  let Some(url) = ns_request.URL() else {
+    return;
+  };
+
+  #[cfg(feature = "tracing")]
+  if let Some(uri) = url.absoluteString() {
+    span.record("uri", uri.to_string());
+  }
+
+  // `Arc` rather than `Rc`: handlers may resolve (and drop) the responder from another thread,
+  // so the reference count must be atomic. The task methods themselves are validated before use.
+  #[allow(clippy::arc_with_non_send_sync)]
+  let ctx = Arc::new(TaskContext {
+    webview: webview.retain(),
+    task: task.retain(),
+    task_key,
+    task_uuid,
+    webview_id,
+    function,
+  });
+
+  let body = read_body(&ns_request);
+  match to_http_request(&ns_request, body) {
+    Some(request) => dispatch(ctx, request, url, MAX_REDIRECTS),
+    None => {
+      let _ = ctx.send(&url, not_found());
+    }
+  }
+}
+
+/// A running `WKURLSchemeTask` and the handler serving it.
+struct TaskContext {
+  // FIXME: though we give it a static lifetime, it's not guaranteed to be valid.
+  webview: Retained<WryWebView>,
+  // FIXME: though we give it a static lifetime, it's not guaranteed to be valid.
+  task: Retained<ProtocolObject<dyn WKURLSchemeTask>>,
+  task_key: usize,
+  task_uuid: Retained<NSUUID>,
+  webview_id: String,
+  function: ProtocolFn,
+}
+
+impl TaskContext {
+  /// Task may not live longer than async custom protocol handler.
+  ///
+  /// There are roughly 2 ways to cause segfault:
+  /// 1. Task has stopped. pointer of the task not valid anymore.
+  /// 2. Task had stopped, but the pointer of the task has allocated to a new task.
+  ///    Outdated custom handler may call to the new task instance and cause segfault.
+  fn validate(&self) -> crate::Result<()> {
+    if !WEBVIEW_STATE.read().unwrap().contains_key(&self.webview_id) {
+      return Err(crate::Error::CustomProtocolTaskInvalid);
+    }
+    match self.webview.get_custom_task_uuid(self.task_key) {
+      Some(latest_uuid) if latest_uuid == self.task_uuid => Ok(()),
+      _ => Err(crate::Error::CustomProtocolTaskInvalid),
+    }
+  }
+
+  /// Validates the task, then calls `f` (a `WKURLSchemeTask` method), catching ObjC exceptions.
+  fn call(&self, f: impl FnOnce()) -> crate::Result<()> {
+    self.validate()?;
+    objc2::exception::catch(AssertUnwindSafe(f))
+      .map_err(|_e| crate::Error::CustomProtocolTaskInvalid)
+  }
+
+  fn responds_to(&self, sel: Sel) -> bool {
+    let responds: Bool = unsafe { msg_send![&*self.task, respondsToSelector: sel] };
+    responds.as_bool()
+  }
+
+  /// Delivers `response` for `url` and finishes the task.
+  fn send(&self, url: &NSURL, response: HttpResponse<Cow<'_, [u8]>>) -> crate::Result<()> {
+    let ns_response = to_ns_response(url, &response);
+    self.call(|| unsafe { self.task.didReceiveResponse(&ns_response) })?;
+
+    let data = match response.into_body() {
+      Cow::Owned(content) => NSData::from_vec(content),
+      Cow::Borrowed(content) => NSData::with_bytes(content),
+    };
+    self.call(|| unsafe { self.task.didReceiveData(&data) })?;
+    self.call(|| unsafe { self.task.didFinish() })?;
+
+    if WEBVIEW_STATE.read().unwrap().contains_key(&self.webview_id) {
+      self.webview.remove_custom_task_key(self.task_key);
+      Ok(())
+    } else {
+      Err(crate::Error::CustomProtocolTaskInvalid)
+    }
+  }
+}
+
+/// Calls the handler with `request` and delivers its response to the task, following redirects.
+fn dispatch(
+  ctx: Arc<TaskContext>,
+  request: Request<Vec<u8>>,
+  url: Retained<NSURL>,
+  redirects_left: u8,
+) {
+  let original = (
+    request.method().clone(),
+    request.headers().clone(),
+    request.body().clone(),
+  );
+  let responder_ctx = ctx.clone();
+  let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> = Box::new(move |response| {
+    if let Err(_e) = responder_ctx.validate() {
+      #[cfg(feature = "tracing")]
+      tracing::warn!("Task invalid before sending response: {:?}", _e);
+      return;
+    }
+
+    let result = match redirect_target(&url, &response) {
+      Some(new_url) if redirects_left > 0 => redirect(
+        responder_ctx,
+        &url,
+        response,
+        new_url,
+        original,
+        redirects_left - 1,
+      ),
+      _ => responder_ctx.send(&url, response),
+    };
+
+    if let Err(_e) = result {
+      #[cfg(feature = "tracing")]
+      tracing::error!("Error responding to task: {:?}", _e);
+    }
+  });
+
+  #[cfg(feature = "tracing")]
+  let _span = tracing::info_span!("wry::custom_protocol::call_handler").entered();
+
+  (ctx.function)(
+    &ctx.webview_id,
+    request,
+    RequestAsyncResponder { responder },
+  );
+}
+
+/// The URL a `3xx` response redirects to, if WebKit can follow it within the task:
+/// it has a valid `Location` with the same scheme as `url`.
+fn redirect_target(url: &NSURL, response: &HttpResponse<Cow<'_, [u8]>>) -> Option<Retained<NSURL>> {
+  if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+    return None;
+  }
+  let location = response.headers().get(LOCATION)?.to_str().ok()?;
+  let new_url =
+    NSURL::URLWithString_relativeToURL(&NSString::from_str(location), Some(url))?.absoluteURL()?;
+
+  let scheme = |url: &NSURL| url.scheme().map(|s| s.to_string().to_ascii_lowercase());
+  (scheme(&new_url)? == scheme(url)?).then_some(new_url)
+}
+
+/// Tells WebKit that the task was redirected to `new_url`, then serves the new request
+/// with the same handler on the same task.
+///
+/// Uses `-[WKURLSchemeTask _willPerformRedirection:newRequest:completionHandler:]`, or the older
+/// `_didPerformRedirection:newRequest:` (both private WebKit API). Without either, the `3xx`
+/// response is delivered as-is.
+fn redirect(
+  ctx: Arc<TaskContext>,
+  url: &NSURL,
+  response: HttpResponse<Cow<'_, [u8]>>,
+  new_url: Retained<NSURL>,
+  (method, headers, body): (Method, HeaderMap, Vec<u8>),
+  redirects_left: u8,
+) -> crate::Result<()> {
+  let (method, headers, body) = redirected_request(response.status(), method, headers, body);
+
+  let ns_response = to_ns_response(url, &response);
+  let ns_request = NSMutableURLRequest::requestWithURL(&new_url);
+  ns_request.setHTTPMethod(&NSString::from_str(method.as_str()));
+  for (name, value) in &headers {
+    if let Ok(value) = value.to_str() {
+      ns_request.addValue_forHTTPHeaderField(
+        &NSString::from_str(value),
+        &NSString::from_str(name.as_str()),
+      );
+    }
+  }
+
+  if ctx.responds_to(sel!(_willPerformRedirection:newRequest:completionHandler:)) {
+    let block_ctx = ctx.clone();
+    let body = Cell::new(Some(body));
+    let completion = RcBlock::new(move |final_request: *mut NSURLRequest| {
+      // SAFETY: WebKit passes a valid request, or null when the load was cancelled.
+      let Some(final_request) = (unsafe { final_request.as_ref() }) else {
+        return;
+      };
+      let Some(final_url) = final_request.URL() else {
+        return;
+      };
+      let body = body.take().unwrap_or_default();
+      match to_http_request(final_request, body) {
+        Some(request) => dispatch(block_ctx.clone(), request, final_url, redirects_left),
+        None => {
+          let _ = block_ctx.send(&final_url, not_found());
+        }
+      }
+    });
+    ctx.call(|| unsafe {
+      let _: () = msg_send![
+        &*ctx.task,
+        _willPerformRedirection: &*ns_response,
+        newRequest: &*ns_request,
+        completionHandler: &*completion
+      ];
+    })
+  } else if ctx.responds_to(sel!(_didPerformRedirection:newRequest:)) {
+    ctx.call(|| unsafe {
+      let _: () = msg_send![
+        &*ctx.task,
+        _didPerformRedirection: &*ns_response,
+        newRequest: &*ns_request
+      ];
+    })?;
+    match to_http_request(&ns_request, body) {
+      Some(request) => dispatch(ctx, request, new_url, redirects_left),
+      None => ctx.send(&new_url, not_found())?,
+    }
+    Ok(())
+  } else {
+    ctx.send(url, response)
+  }
+}
+
+/// Method, headers and body of the request that follows a redirect with `status`, as in the
+/// Fetch standard: `303` (except for `HEAD`), and `301`/`302` for `POST`, switch to a bodiless `GET`.
+fn redirected_request(
+  status: StatusCode,
+  method: Method,
+  mut headers: HeaderMap,
+  body: Vec<u8>,
+) -> (Method, HeaderMap, Vec<u8>) {
+  let to_get = (status == StatusCode::SEE_OTHER && method != Method::HEAD)
+    || (matches!(status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
+      && method == Method::POST);
+  if !to_get {
+    return (method, headers, body);
+  }
+  for name in [
+    CONTENT_TYPE,
+    CONTENT_LENGTH,
+    http::header::CONTENT_ENCODING,
+    http::header::CONTENT_LANGUAGE,
+  ] {
+    headers.remove(name);
+  }
+  (Method::GET, headers, Vec::new())
+}
+
+fn read_body(request: &NSURLRequest) -> Vec<u8> {
+  if let Some(body) = request.HTTPBody() {
+    return body.to_vec();
+  }
+  let mut sent_form_body = Vec::new();
+  if let Some(body_stream) = request.HTTPBodyStream() {
+    body_stream.open();
+
+    let mut buf = [0u8; 128];
+    while body_stream.hasBytesAvailable() {
+      let count =
+        unsafe { body_stream.read_maxLength(NonNull::new(buf.as_mut_ptr()).unwrap(), buf.len()) };
+      sent_form_body.extend_from_slice(&buf[..count as usize]);
+    }
+
+    body_stream.close();
+  }
+  sent_form_body
+}
+
+fn to_http_request(request: &NSURLRequest, body: Vec<u8>) -> Option<Request<Vec<u8>>> {
+  let uri = request.URL()?.absoluteString()?.to_string();
+  // Get request method (GET, POST, PUT etc...)
+  let method = request
+    .HTTPMethod()
+    .map(|m| m.to_string())
+    .unwrap_or_else(|| "GET".to_string());
+
+  let mut http_request = Request::builder().uri(uri).method(method.as_str());
+
+  // get all our headers values and inject them in our request
+  if let Some(all_headers) = request.allHTTPHeaderFields() {
+    for current_header in all_headers.allKeys().iter() {
+      let header_value = all_headers.valueForKey(&current_header).unwrap();
+      http_request = http_request.header(current_header.to_string(), header_value.to_string());
+    }
+  }
+
+  http_request.body(body).ok()
+}
+
+fn to_ns_response(
+  url: &NSURL,
+  response: &HttpResponse<Cow<'_, [u8]>>,
+) -> Retained<NSHTTPURLResponse> {
+  let content_len = response.body().len();
+  // default: application/octet-stream, but should be provided by the client
+  let wanted_mime = response.headers().get(CONTENT_TYPE);
+  // default to 200
+  let wanted_status_code = response.status().as_u16() as i32;
+  // default to HTTP/1.1
+  let wanted_version = format!("{:#?}", response.version());
+
+  let headers = NSMutableDictionary::new();
+  if let Some(mime) = wanted_mime.and_then(|mime| mime.to_str().ok()) {
+    headers.insert(
+      &*NSString::from_str(CONTENT_TYPE.as_str()),
+      &*NSString::from_str(mime),
+    );
+  }
+  headers.insert(
+    &*NSString::from_str(CONTENT_LENGTH.as_str()),
+    &*NSString::from_str(&content_len.to_string()),
+  );
+
+  // add headers
+  for (name, value) in response.headers().iter() {
+    if let Ok(value) = value.to_str() {
+      headers.insert(
+        &*NSString::from_str(name.as_str()),
+        &*NSString::from_str(value),
+      );
+    }
+  }
+
+  NSHTTPURLResponse::initWithURL_statusCode_HTTPVersion_headerFields(
+    NSHTTPURLResponse::alloc(),
+    url,
+    wanted_status_code.try_into().unwrap(),
+    Some(&NSString::from_str(&wanted_version)),
+    Some(&headers),
+  )
+  .unwrap()
+}
+
+fn not_found() -> HttpResponse<Cow<'static, [u8]>> {
+  HttpResponse::builder()
+    .status(StatusCode::NOT_FOUND)
+    .body(Cow::Borrowed(&[][..]))
+    .unwrap()
 }
 
 extern "C" fn stop_task(

@@ -345,6 +345,7 @@
 #[cfg(any(target_os = "windows", target_os = "android"))]
 mod custom_protocol_workaround;
 mod error;
+mod http_interception;
 #[cfg(any(target_os = "android", test))]
 mod inject_initialization_scripts;
 mod permissions;
@@ -399,7 +400,7 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
   ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Environment,
 };
 
-use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 use http::{Request, Response};
 
@@ -643,6 +644,14 @@ struct WebViewAttributes<'a> {
   pub custom_protocols:
     HashMap<String, Box<dyn Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync>>,
 
+  /// Handlers for requests to `http(s)` origins, keyed by normalized origin
+  /// (`<scheme>://<host>[:<port>]`, lowercase, without the default port).
+  ///
+  /// Use [`WebViewBuilder::with_http_interceptor`] to add entries.
+  /// Only supported where [`is_http_interception_supported`] returns `true`.
+  pub http_interceptors:
+    HashMap<String, Box<dyn Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync>>,
+
   /// The IPC handler to receive the message from Javascript on webview
   /// using `window.ipc.postMessage("insert_message_here")` to host Rust code.
   pub ipc_handler: Option<Box<dyn Fn(Request<String>)>>,
@@ -862,6 +871,7 @@ impl Default for WebViewAttributes<'_> {
       html: None,
       initialization_scripts: Default::default(),
       custom_protocols: Default::default(),
+      http_interceptors: Default::default(),
       ipc_handler: None,
       drag_drop_handler: None,
       navigation_handler: None,
@@ -1073,10 +1083,24 @@ impl<'a> WebViewBuilder<'a> {
   ///   elsewhere in Android (provided the app has appropriate access), but not from the `assets`
   ///   folder which lives within the apk. For the cases where this can be used, it works the same as in macOS and Linux.
   /// - iOS: To get the path of your assets, you can call [`CFBundle::resources_path`](https://docs.rs/core-foundation/latest/core_foundation/bundle/struct.CFBundle.html#method.resources_path). So url like `wry://assets/index.html` could get the html file in assets directory.
+  ///
+  /// # `http(s)` origins
+  ///
+  /// When `name` contains `://` (which no scheme name can), it is treated as an `http(s)` origin
+  /// and the call is forwarded to [`Self::with_http_interceptor`]. This lets wrappers that only
+  /// expose custom protocols (e.g. Tauri's `register_asynchronous_uri_scheme_protocol`) intercept
+  /// a real origin such as `"https://app.com"`, or every origin of a scheme with
+  /// [`ANY_HTTP_ORIGIN`] / [`ANY_HTTPS_ORIGIN`].
   pub fn with_custom_protocol<F>(mut self, name: String, handler: F) -> Self
   where
     F: Fn(WebViewId, Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> + Send + Sync + 'static,
   {
+    if is_http_origin(&name) {
+      return self.with_http_interceptor(&name, move |id, request, responder| {
+        responder.respond(handler(id, request))
+      });
+    }
+
     #[cfg(any(
       target_os = "linux",
       target_os = "dragonfly",
@@ -1137,10 +1161,30 @@ impl<'a> WebViewBuilder<'a> {
   ///     });
   ///   });
   /// ```
+  ///
+  /// # Redirects
+  ///
+  /// - **macOS / iOS**: A `3xx` response with a `Location` of the same scheme is followed within
+  ///   the request, as a browser would: the page or `fetch` sees the new URL, and `handler` is
+  ///   called again with the redirected request (`303`, and `301`/`302` for `POST`, become a
+  ///   bodiless `GET`). This uses private WebKit API (`_willPerformRedirection:…` on the scheme
+  ///   task); when it is missing, or after 20 redirects, the `3xx` response is delivered as-is.
+  ///
+  /// # `http(s)` origins
+  ///
+  /// When `name` contains `://` (which no scheme name can), it is treated as an `http(s)` origin
+  /// and the call is forwarded to [`Self::with_http_interceptor`]. This lets wrappers that only
+  /// expose custom protocols (e.g. Tauri's `register_asynchronous_uri_scheme_protocol`) intercept
+  /// a real origin such as `"https://app.com"`, or every origin of a scheme with
+  /// [`ANY_HTTP_ORIGIN`] / [`ANY_HTTPS_ORIGIN`].
   pub fn with_asynchronous_custom_protocol<F>(mut self, name: String, handler: F) -> Self
   where
     F: Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync + 'static,
   {
+    if is_http_origin(&name) {
+      return self.with_http_interceptor(&name, handler);
+    }
+
     #[cfg(any(
       target_os = "linux",
       target_os = "dragonfly",
@@ -1164,6 +1208,140 @@ impl<'a> WebViewBuilder<'a> {
 
     self.attrs.custom_protocols.insert(name, Box::new(handler));
     self
+  }
+
+  /// Intercept every request to an `http` or `https` origin, such as `https://app.com`,
+  /// and resolve it with `handler` instead of the network.
+  ///
+  /// Unlike [`Self::with_custom_protocol`], this does not register a new scheme: the page
+  /// keeps the real origin (`https://app.com`), and the handler receives the request URI
+  /// unchanged. Requests to other origins, including subdomains, are not intercepted.
+  ///
+  /// `origin` is `<scheme>://<host>[:<port>]` with an optional trailing `/`. The scheme must be
+  /// `http` or `https`. Scheme and host are matched case-insensitively, and a default port
+  /// (`80` for `http`, `443` for `https`) matches the origin without a port.
+  ///
+  /// `origin` can also be [`ANY_HTTP_ORIGIN`] (`http://*`) or [`ANY_HTTPS_ORIGIN`] (`https://*`),
+  /// which match every origin of that scheme. An interceptor for the exact origin takes precedence
+  /// over the wildcard. To intercept both schemes at once, use
+  /// [`Self::with_http_interceptor_for_all`].
+  ///
+  /// Check [`is_http_interception_supported`] before calling this. On an unsupported platform,
+  /// [`Self::build`] returns [`Error::HttpInterceptionUnsupported`] instead of silently loading
+  /// the origin from the network. An invalid origin returns [`Error::InvalidHttpInterceptorOrigin`],
+  /// and registering the same origin twice returns [`Error::DuplicateHttpInterceptor`].
+  ///
+  /// When a request matches a custom protocol workaround URI (e.g. `http://wry.localhost` on
+  /// Windows and Android), an interceptor for that exact origin is used, otherwise the custom
+  /// protocol is used, even if a wildcard interceptor matches.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Android**: `WebViewClient.shouldInterceptRequest` does not expose the request body, so
+  ///   `handler` gets an empty body unless the page hands it over first. With interceptors
+  ///   registered, wry exposes a synchronous `@JavascriptInterface`, `window.__wryHttpBodies`, in
+  ///   every frame. An initialization script provided by the app (for all frames, e.g. with
+  ///   [`Self::with_initialization_script_for_main_only`] set to `false`) can then, before a
+  ///   request with a body leaves:
+  ///   1. call `window.__wryHttpBodies.put(id, base64Body)` with a unique `id`;
+  ///   2. send the request to its URL with the query parameter `__wry_body=<id>` appended.
+  ///
+  ///   wry passes the stored body to `handler` and removes `__wry_body` from the request URI.
+  ///   Bodies are never taken by `GET`, `HEAD` or `OPTIONS` requests (so a CORS preflight to the
+  ///   tagged URL leaves it for the actual request), and expire after 60 seconds.
+  ///   Redirect responses (`3xx`) are not supported.
+  ///   Does not work together with [`WebViewBuilderExtAndroid::with_asset_loader`].
+  /// - **macOS / iOS**: WKWebView does not allow URL scheme handlers for `http(s)`, so wry swizzles
+  ///   `+[WKWebView handlesURLScheme:]` (process-wide) to return `NO` for `http` and `https`.
+  ///   This relies on WebKit behavior outside the public API. Once a scheme is intercepted,
+  ///   WebKit sends **every** request of that scheme to wry, so requests matched by no
+  ///   interceptor (exact or wildcard) are fetched with `NSURLSession` (the shared session, or an ephemeral one when incognito):
+  ///   their cookies live in `NSHTTPCookieStorage` instead of the webview's data store, redirects
+  ///   are followed without changing the page URL, and responses are buffered, not streamed.
+  ///   Registering a custom protocol named `http` or `https` together with an interceptor of that
+  ///   scheme returns [`Error::UrlSchemeRegisterError`].
+  ///   Redirect responses (`3xx` with a `Location` of the same scheme) are followed like a browser
+  ///   does, see [`Self::with_asynchronous_custom_protocol`].
+  /// - **Linux**: Unsupported. WebKitGTK cannot intercept `http(s)` requests.
+  ///
+  /// # Examples
+  ///
+  /// ```no_run
+  /// use wry::WebViewBuilder;
+  ///
+  /// let mut builder = WebViewBuilder::new();
+  /// if wry::is_http_interception_supported() {
+  ///   builder = builder
+  ///     .with_http_interceptor("https://app.com", |_webview_id, request, responder| {
+  ///       let body = format!("intercepted {}", request.uri());
+  ///       responder.respond(http::Response::builder().body(body.into_bytes()).unwrap());
+  ///     })
+  ///     .with_url("https://app.com/");
+  /// }
+  /// ```
+  pub fn with_http_interceptor<F>(mut self, origin: &str, handler: F) -> Self
+  where
+    F: Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync + 'static,
+  {
+    if !is_http_interception_supported() {
+      self.error = self.error.and(Err(Error::HttpInterceptionUnsupported));
+      return self;
+    }
+
+    let Some(origin_key) = http_interception::normalize_origin(origin) else {
+      let err = Err(Error::InvalidHttpInterceptorOrigin(origin.to_string()));
+      self.error = self.error.and(err);
+      return self;
+    };
+
+    if self.attrs.http_interceptors.contains_key(&origin_key) {
+      self.error = self
+        .error
+        .and(Err(Error::DuplicateHttpInterceptor(origin_key)));
+      return self;
+    }
+
+    self
+      .attrs
+      .http_interceptors
+      .insert(origin_key, Box::new(handler));
+    self
+  }
+
+  /// Intercept every `http` and `https` request with `handler`, instead of the network.
+  ///
+  /// Shorthand for [`Self::with_http_interceptor`] with [`ANY_HTTP_ORIGIN`] and
+  /// [`ANY_HTTPS_ORIGIN`], sharing one handler. Interceptors registered for an exact origin
+  /// still take precedence, and so do custom protocols (including their `http(s)` workaround URI
+  /// on Windows and Android). Same platform support and limitations as
+  /// [`Self::with_http_interceptor`].
+  ///
+  /// # Examples
+  ///
+  /// ```no_run
+  /// use wry::WebViewBuilder;
+  ///
+  /// let builder = WebViewBuilder::new()
+  ///   .with_http_interceptor_for_all(|_webview_id, request, responder| {
+  ///     // e.g. fetch `request` with your own HTTP client, block ads, cache…
+  ///     let body = format!("intercepted {}", request.uri());
+  ///     responder.respond(http::Response::builder().body(body.into_bytes()).unwrap());
+  ///   })
+  ///   .with_url("https://app.com/");
+  /// ```
+  pub fn with_http_interceptor_for_all<F>(self, handler: F) -> Self
+  where
+    F: Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync + 'static,
+  {
+    let handler = Arc::new(handler);
+    let https_handler = handler.clone();
+    self
+      .with_http_interceptor(ANY_HTTP_ORIGIN, move |id, request, responder| {
+        handler(id, request, responder)
+      })
+      .with_http_interceptor(ANY_HTTPS_ORIGIN, move |id, request, responder| {
+        https_handler(id, request, responder)
+      })
   }
 
   /// Set the IPC handler to receive the message from Javascript on webview
@@ -2312,6 +2490,31 @@ pub enum DragDropEvent {
   },
   /// The drag operation has been cancelled or left the window.
   Leave,
+}
+
+/// Wildcard origin for [`WebViewBuilder::with_http_interceptor`] matching every `http` origin.
+///
+/// Can also be passed as a custom protocol name, see
+/// [`WebViewBuilder::with_asynchronous_custom_protocol`].
+pub const ANY_HTTP_ORIGIN: &str = "http://*";
+
+/// Wildcard origin for [`WebViewBuilder::with_http_interceptor`] matching every `https` origin.
+///
+/// Can also be passed as a custom protocol name, see
+/// [`WebViewBuilder::with_asynchronous_custom_protocol`].
+pub const ANY_HTTPS_ORIGIN: &str = "https://*";
+
+/// Whether a custom protocol `name` is actually an `http(s)` origin to intercept,
+/// see [`WebViewBuilder::with_asynchronous_custom_protocol`].
+fn is_http_origin(name: &str) -> bool {
+  name.contains("://")
+}
+
+/// Whether [`WebViewBuilder::with_http_interceptor`] is supported on the current platform.
+///
+/// Returns `true` on Android, Windows, macOS and iOS, `false` on Linux.
+pub fn is_http_interception_supported() -> bool {
+  http_interception::SUPPORTED
 }
 
 /// Get WebView/Webkit version on current platform.

@@ -16,6 +16,8 @@ import kotlin.collections.Map
 @SuppressLint("RestrictedApi")
 class RustWebView(context: Context, val initScripts: Array<String>, val id: String): WebView(context) {
     val isDocumentStartScriptEnabled: Boolean
+    /** Set when HTTP interceptors are registered, see [HttpBodies]. */
+    @Volatile var httpBodies: HttpBodies? = null
 
     init {
         settings.javaScriptEnabled = true

@@ -9,7 +9,7 @@ use http::{
 use jni::errors::Result as JniResult;
 pub use jni::{
   self, JNIEnv,
-  objects::{GlobalRef, JClass, JMap, JObject, JString},
+  objects::{GlobalRef, JByteArray, JClass, JMap, JObject, JString},
   sys::{jboolean, jint, jobject, jstring},
 };
 pub use ndk;
@@ -48,7 +48,7 @@ macro_rules! android_binding {
       $package,
       Rust,
       handleRequest,
-      [JString, JObject, jboolean],
+      [JString, JObject, jboolean, JByteArray],
       jobject
     );
     android_fn!(
@@ -102,6 +102,7 @@ fn handle_request(
   webview_id: JString,
   request: JObject,
   is_document_start_script_enabled: jboolean,
+  body: JByteArray,
 ) -> JniResult<jobject> {
   let webview_id = env.get_string(&webview_id)?;
   let webview_id = webview_id.to_str().unwrap_or_default();
@@ -130,6 +131,13 @@ fn handle_request(
     .l()?
     .into();
   let url = env.get_string(&url)?.to_string_lossy().to_string();
+  // Requests whose body the app's script handed to `HttpBodies` carry its id in the URL.
+  let (url, body_id) = crate::http_interception::take_body_id(&url);
+  let body = if body_id.is_some() && !body.is_null() {
+    env.convert_byte_array(&body)?
+  } else {
+    Vec::new()
+  };
 
   #[cfg(feature = "tracing")]
   span.record("uri", &url);
@@ -166,7 +174,7 @@ fn handle_request(
     }
   }
 
-  let final_request = match request_builder.body(Vec::new()) {
+  let final_request = match request_builder.body(body) {
     Ok(req) => req,
     Err(_e) => {
       #[cfg(feature = "tracing")]
@@ -325,12 +333,14 @@ pub unsafe fn handleRequest(
   webview_id: JString,
   request: JObject,
   is_document_start_script_enabled: jboolean,
+  body: JByteArray,
 ) -> jobject {
   match handle_request(
     &mut env,
     webview_id,
     request,
     is_document_start_script_enabled,
+    body,
   ) {
     Ok(response) => response,
     Err(_e) => {
